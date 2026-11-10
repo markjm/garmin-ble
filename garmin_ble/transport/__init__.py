@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 from .base import DisconnectCallback, LinkInfo, NotifyCallback, Transport
 from .replay import ReplayTransport
-from .simulated import SimulatedTransport, WatchProfile, available_profiles, get_profile
+from .simulated import SimulatedFile, SimulatedTransport, WatchProfile, available_profiles, get_profile
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .ble import BleTransport
@@ -38,6 +38,7 @@ __all__ = [
     "DisconnectCallback",
     "BleTransport",
     "SimulatedTransport",
+    "SimulatedFile",
     "ReplayTransport",
     "WatchProfile",
     "available_profiles",

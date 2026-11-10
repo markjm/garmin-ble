@@ -26,6 +26,9 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
 ]
 
+[project.scripts]
+garmin-dive-sync = "garmin_dive_sync.cli:main"
+
 [project.urls]
 Homepage = "https://github.com/gwerneckp/garmin-ble"
 Repository = "https://github.com/gwerneckp/garmin-ble"
@@ -37,6 +40,7 @@ packages = [
     "garmin_ble.protobuf",
     "garmin_ble.protocol",
     "garmin_ble.transport",
+    "garmin_dive_sync",
 ]
 
 [project.optional-dependencies]

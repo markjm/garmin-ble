@@ -20,6 +20,23 @@ A clean-room Python implementation of Garmin's proprietary BLE protocol (GFDI V2
 
 ---
 
+## Sync a Garmin Descent to Subsurface
+
+This fork adds `garmin-dive-sync`, which downloads dives from a Garmin Descent
+over Bluetooth into a folder that [Subsurface](https://subsurface-divelog.org/)
+imports as if the watch were plugged in over USB:
+
+```bash
+pip install -e .
+garmin-dive-sync            # dives land in ~/GarminDives
+```
+
+Then in Subsurface: **Import > Import from dive computer**, vendor **Garmin**,
+product **Descent Mk3(i)**, and set **Device or mount point** to `~/GarminDives`.
+The full guide is in [docs/dive-sync.md](./docs/dive-sync.md).
+
+It is tested against the simulator but not yet on a physical Descent.
+
 ## Features
 
 - Live telemetry over BLE, without Garmin Connect:
@@ -41,6 +58,8 @@ A clean-room Python implementation of Garmin's proprietary BLE protocol (GFDI V2
   - COBS (Consistent Overhead Byte Stuffing) encoding and decoding
   - compiled protobufs for `gdi_smart_proto`
   - CRC16 checks
+- File transfer: list the files on the watch and download any of them, such as
+  recorded activities and dives.
 - Reconnection with exponential backoff. Subscriptions are restored after a BLE drop.
 - A periodic time-sync heartbeat that keeps the link alive.
 - A simulator and session replay, so you can develop, test, and reproduce bugs without a watch.
@@ -149,7 +168,7 @@ release:
 | v0.3.0 | `Watch` API, transports, simulator, and replay | Done |
 | v0.4.0 | Protobuf settings and device state | In progress |
 | v0.5.0 | Notifications and media control | Planned |
-| v0.6.0 | File transfers (FIT and GPX downloads) | Planned |
+| v0.6.0 | File transfers (FIT and GPX downloads) | Downloads done |
 | v1.0.0 | Stable release | Planned |
 
 ---

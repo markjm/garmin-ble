@@ -134,3 +134,47 @@ class TestCobsEdgeCases:
         codec.reset()
         assert codec.retrieve_message() is None
         assert len(codec._buffer) == 0
+
+
+# Framing across notifications
+
+class TestCobsStreaming:
+    """BLE delivers bytes in arbitrary pieces, which a file transfer makes routine."""
+
+    def drain(self, codec):
+        out = []
+        while True:
+            message = codec.retrieve_message()
+            if message is None:
+                return out
+            out.append(message)
+
+    def test_two_frames_in_one_notification(self):
+        codec = CobsCoDec()
+        codec.received_bytes(CobsCoDec.encode(b"first\x00one") + CobsCoDec.encode(b"second"))
+        assert self.drain(codec) == [b"first\x00one", b"second"]
+
+    def test_frame_split_across_notifications(self):
+        encoded = CobsCoDec.encode(bytes(range(256)) * 3)
+        codec = CobsCoDec()
+        for i in range(0, len(encoded), 19):
+            codec.received_bytes(encoded[i : i + 19])
+        assert self.drain(codec) == [bytes(range(256)) * 3]
+
+    def test_notification_ending_one_frame_and_starting_the_next(self):
+        first, second = CobsCoDec.encode(b"alpha"), CobsCoDec.encode(b"beta\x00gamma")
+        stream = first + second
+        codec = CobsCoDec()
+        cut = len(first) + 3
+        codec.received_bytes(stream[:cut])
+        assert self.drain(codec) == [b"alpha"]
+        codec.received_bytes(stream[cut:])
+        assert self.drain(codec) == [b"beta\x00gamma"]
+
+    def test_split_exactly_between_frames(self):
+        first, second = CobsCoDec.encode(b"alpha"), CobsCoDec.encode(b"beta")
+        codec = CobsCoDec()
+        codec.received_bytes(first[:-1])
+        codec.received_bytes(first[-1:] + second[:1])
+        codec.received_bytes(second[1:])
+        assert self.drain(codec) == [b"alpha", b"beta"]

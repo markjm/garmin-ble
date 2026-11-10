@@ -1,4 +1,5 @@
 import time
+from collections import deque
 
 class CobsCoDec:
     """
@@ -9,59 +10,67 @@ class CobsCoDec:
     def __init__(self):
         self._buffer = bytearray()
         self._last_update = 0
-        self._decoded_message = None
+        self._messages = deque()
 
     def received_bytes(self, data: bytes):
         now = time.time()
         if (now - self._last_update) > self.BUFFER_TIMEOUT_SEC:
-            self.reset()
+            self._buffer.clear()
         self._last_update = now
 
         self._buffer.extend(data)
         self._decode()
 
     def reset(self):
-        self._decoded_message = None
+        self._messages.clear()
         self._buffer.clear()
 
     def retrieve_message(self) -> bytes:
-        result = self._decoded_message
-        self._decoded_message = None
-        return result
+        """The next complete message, or ``None`` if there is none waiting.
+
+        Call it until it returns ``None``: one notification can complete more
+        than one frame, which happens routinely during a file transfer.
+        """
+        return self._messages.popleft() if self._messages else None
 
     def _decode(self):
-        if self._decoded_message is not None:
-            return
+        """Move every complete frame out of the buffer.
 
-        if len(self._buffer) < 4:
-            return
+        A frame is ``00 <stuffed bytes, none of them zero> 00``. Frames can
+        arrive split across notifications or several to a notification, so the
+        buffer is cut at the zero delimiters rather than assumed to hold
+        exactly one frame.
+        """
+        buffer = self._buffer
+        while True:
+            if len(buffer) < 4 or buffer[0] != 0x00:
+                return
+            end = buffer.find(0x00, 1)
+            if end < 0:
+                return
+            if end < 3:
+                # Too short to be a frame: the closing delimiter of one frame
+                # followed directly by the opening delimiter of the next.
+                del buffer[:end]
+                continue
 
-        if self._buffer[-1] != 0x00:
-            return
+            frame = bytes(buffer[1:end])
+            del buffer[: end + 1]
+            self._messages.append(self._unstuff(frame))
 
-        if self._buffer[0] != 0x00:
-            return
-
-        frame = self._buffer[1:-1]
+    @staticmethod
+    def _unstuff(frame: bytes) -> bytes:
         decoded = bytearray()
-        
         i = 0
         while i < len(frame):
             code = frame[i]
             i += 1
-            
-            if code == 0:
-                break
-                
             payload_size = code - 1
             decoded.extend(frame[i : i + payload_size])
             i += payload_size
-            
             if code != 0xFF and i < len(frame):
                 decoded.append(0x00)
-
-        self._decoded_message = bytes(decoded)
-        self._buffer.clear()
+        return bytes(decoded)
 
     @staticmethod
     def encode(data: bytes) -> bytes:

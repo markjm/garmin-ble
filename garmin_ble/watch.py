@@ -43,10 +43,12 @@ from .constants import GarminMessage, GarminService, SystemEventType
 from .errors import (
     CLOSE_ALL,
     REGISTER_ML,
+    ConnectionFailed,
     HandshakeError,
     NotConnected,
     RequestTimeout,
     ServiceUnavailable,
+    TransferError,
 )
 from .frames import Direction, Frame, FrameKind, Recorder
 from .logging import get_logger
@@ -56,6 +58,8 @@ from .protobuf import gdi_device_status_pb2, gdi_find_my_watch_pb2
 from .protobuf import gdi_installed_apps_service_pb2 as apps_pb2
 from .protobuf import gdi_smart_proto_pb2
 from .protocol import cobs, gfdi, mlr
+from .protocol import files as ft
+from .protocol.crc import compute_crc
 from .protocol.smart import SmartRouter
 from .report import CollectionResult, Missing
 from .transport import ReplayTransport, SimulatedTransport, Transport
@@ -72,6 +76,9 @@ Duration = Union[timedelta, float, int]
 
 #: A user callback taking one reading or message; sync or async, both awaited.
 Handler = Callable[[Any], Union[None, Awaitable[None]]]
+
+#: Called during a download with ``(bytes_received, total_bytes)``.
+ProgressCallback = Callable[[int, int], None]
 
 #: Pushed into subscriber queues to end an async iterator on teardown.
 _SENTINEL = object()
@@ -181,6 +188,32 @@ class Diagnostics:
         )
 
 
+class _Download:
+    """The one file download in flight, and what has arrived of it so far."""
+
+    #: Consecutive bad chunks tolerated before the download is abandoned.
+    MAX_REJECTIONS = 5
+
+    def __init__(self, index: int, progress: Optional[ProgressCallback]):
+        loop = asyncio.get_event_loop()
+        self.index = index
+        self.progress = progress
+        self.size: Optional[int] = None     # known once the watch accepts
+        self.data = bytearray()
+        self.crc = 0                        # running CRC of everything in data
+        self.rejections = 0
+        self.accepted: "asyncio.Future" = loop.create_future()
+        self.done: "asyncio.Future" = loop.create_future()
+
+    def fail(self, error: Exception) -> None:
+        for future in (self.accepted, self.done):
+            if not future.done():
+                future.set_exception(error)
+                # Whoever awaits one of these stops awaiting the other, and an
+                # exception nobody retrieves is reported as a warning at exit.
+                future.exception()
+
+
 # Fan-out plumbing
 
 
@@ -233,6 +266,9 @@ class Watch:
     HANDSHAKE_TIMEOUT = 10.0
     #: How long to wait for the watch to answer a service registration.
     REGISTRATION_TIMEOUT = 5.0
+    #: How long to wait for the watch to finish introducing itself (device
+    #: information, then capabilities) before starting a file transfer anyway.
+    CONFIGURATION_TIMEOUT = 10.0
 
     #: Accepted values for the ``reconnect`` policy.
     RECONNECT_POLICIES = ("exponential", "fixed", "off")
@@ -277,6 +313,12 @@ class Watch:
         self._pending_sent_at: Dict[int, float] = {}
         self._next_request_id = 0
         self._responders: Dict[str, Handler] = {}
+
+        # file transfer: the watch serves one download at a time
+        self._download: Optional[_Download] = None
+        self._download_lock = asyncio.Lock()
+        self._send_lock = asyncio.Lock()
+        self._configured = asyncio.Event()
 
         # handshake signalling
         self._close_all_done: Optional["asyncio.Future"] = None
@@ -361,14 +403,18 @@ class Watch:
         seed: Optional[int] = 0,
         heartbeat: Optional[Duration] = None,
         reconnect: str = "off",
+        files: Sequence[Any] = (),
     ) -> "WatchSession":
         """Connect to an in-process watch that speaks the real protocol.
 
         The same ``Watch`` code path runs, so examples and tests exercise the
         library rather than a mock. See
-        :func:`~garmin_ble.transport.simulated.available_profiles`.
+        :func:`~garmin_ble.transport.simulated.available_profiles`. *files* is
+        a sequence of :class:`~garmin_ble.transport.simulated.SimulatedFile`
+        for the watch to hold, for exercising :meth:`files` and
+        :meth:`download`.
         """
-        transport = SimulatedTransport(profile=profile, seed=seed)
+        transport = SimulatedTransport(profile=profile, seed=seed, files=files)
         return WatchSession(
             lambda: transport,
             heartbeat=_seconds(heartbeat),
@@ -475,6 +521,7 @@ class Watch:
         self._handles.clear()
         self.diagnostics.handles.clear()
         self._cobs.reset()
+        self._configured.clear()
 
     async def _handshake(self) -> None:
         """CLOSE_ALL, then register the GFDI control service.
@@ -525,6 +572,7 @@ class Watch:
             if not future.done():
                 future.cancel()
         self._pending.clear()
+        self._fail_download(ConnectionFailed("the session was closed mid-download"))
 
         await self._transport.close()
 
@@ -545,6 +593,7 @@ class Watch:
             return
 
         self._emit(ev.Disconnected(reason=reason, expected=False))
+        self._fail_download(ConnectionFailed(f"link lost mid-download: {reason}"))
         if self._reconnect_policy != "off" and self._transport.can_reconnect:
             self._reconnect_task = asyncio.ensure_future(self._reconnect_loop())
 
@@ -597,8 +646,12 @@ class Watch:
         if handle is None:
             raise NotConnected("GFDI channel is not open")
         encoded = cobs.CobsCoDec.encode(frame)
-        for chunk in mlr.fragment(encoded, self._max_write):
-            await self._write(chunk, FrameKind.GFDI, handle)
+        # A frame spans several writes, and acknowledgements are sent from
+        # background tasks. Without the lock two frames can interleave their
+        # fragments on the wire, which corrupts both.
+        async with self._send_lock:
+            for chunk in mlr.fragment(encoded, self._max_write):
+                await self._write(chunk, FrameKind.GFDI, handle)
 
     async def _reflex_gfdi(self, frame: bytes) -> None:
         """Send a reflex to inbound traffic: an ACK, or a time answer.
@@ -710,11 +763,25 @@ class Watch:
 
     def _on_gfdi_message(self, message: gfdi.GfdiMessage) -> None:
         # Every inbound GFDI message is acknowledged, as the watch expects.
-        if message.type != GarminMessage.RESPONSE:
+        # File data and auth negotiation are answered with their own status
+        # messages instead of the generic one.
+        if message.type not in (
+            GarminMessage.RESPONSE,
+            GarminMessage.FILE_TRANSFER_DATA,
+            GarminMessage.AUTH_NEGOTIATION,
+        ):
             self._schedule(self._reflex_gfdi(gfdi.GfdiMessageBuilder.build_status_ack(message.type)))
 
         if message.type in (GarminMessage.PROTOBUF_REQUEST, GarminMessage.PROTOBUF_RESPONSE):
             self._on_protobuf(message)
+        elif message.type == GarminMessage.FILE_TRANSFER_DATA:
+            self._on_file_data(message)
+        elif message.type == GarminMessage.RESPONSE:
+            self._on_status(message)
+        elif message.type == GarminMessage.CONFIGURATION:
+            self._on_configuration(message)
+        elif message.type == GarminMessage.AUTH_NEGOTIATION:
+            self._on_auth_negotiation(message)
         elif message.type == GarminMessage.CURRENT_TIME_REQUEST:
             self._schedule(self._answer_time_request())
         elif message.type == GarminMessage.SYSTEM_EVENT:
@@ -732,6 +799,17 @@ class Watch:
         upgraded in place a moment later.
         """
         info = gfdi.parse_device_information(message)
+
+        # The watch waits for the host to introduce itself in return before it
+        # sends its capabilities, so answer even if the message was unreadable.
+        self._schedule(
+            self._reflex_gfdi(
+                gfdi.GfdiMessageBuilder.build_device_information_response(
+                    info.protocol_version if info is not None else 0
+                )
+            )
+        )
+
         if info is None or self._info is None:
             return
 
@@ -746,6 +824,34 @@ class Watch:
         if info.max_packet_size:
             self._max_write = min(self._max_write, info.max_packet_size)
         self._emit(ev.DeviceIdentified(info=self._info))
+
+    def _on_configuration(self, message: gfdi.GfdiMessage) -> None:
+        """Exchange capabilities, the last step of the watch's introduction.
+
+        After this the watch considers the host ready, which is what file
+        transfers wait for.
+        """
+        self._schedule(self._finish_configuration())
+
+    async def _finish_configuration(self) -> None:
+        await self._reflex_gfdi(
+            gfdi.GfdiMessageBuilder.build_configuration(gfdi.HOST_CAPABILITIES)
+        )
+        await self._reflex_gfdi(
+            gfdi.GfdiMessageBuilder.build_system_event(int(SystemEventType.SYNC_READY), 0)
+        )
+        self._configured.set()
+
+    def _on_auth_negotiation(self, message: gfdi.GfdiMessage) -> None:
+        parsed = gfdi.parse_auth_negotiation(message)
+        if parsed is None:
+            self.diagnostics.malformed += 1
+            return
+        self._schedule(
+            self._reflex_gfdi(
+                gfdi.GfdiMessageBuilder.build_auth_negotiation_status(*parsed)
+            )
+        )
 
     async def _answer_time_request(self) -> None:
         await self._reflex_gfdi(gfdi.GfdiMessageBuilder.build_time_response())
@@ -830,6 +936,174 @@ class Watch:
                 proto_bytes=body,
             )
         )
+
+    # File transfer
+
+    def _on_status(self, message: gfdi.GfdiMessage) -> None:
+        """Route a RESPONSE from the watch to whatever is waiting on it."""
+        status = ft.parse_status(message)
+        if status is None or status.ref_type != GarminMessage.DOWNLOAD_REQUEST:
+            return
+
+        transfer = self._download
+        answer = ft.parse_download_request_status(status)
+        if transfer is None or answer is None or transfer.accepted.done():
+            return
+
+        if answer.ok:
+            transfer.size = answer.size
+            if answer.size == 0 and not transfer.done.done():
+                transfer.done.set_result(b"")
+        transfer.accepted.set_result(answer)
+
+    def _on_file_data(self, message: gfdi.GfdiMessage) -> None:
+        """Take one chunk of the file being downloaded and acknowledge it.
+
+        The watch sends the next chunk only after this one is acknowledged, so
+        the acknowledgement is what paces the transfer.
+        """
+        chunk = ft.parse_file_transfer_data(message)
+        if chunk is None:
+            self.diagnostics.malformed += 1
+            return
+
+        transfer = self._download
+        if transfer is None or transfer.size is None or transfer.done.done():
+            # Nobody is waiting for this, so tell the watch to stop sending.
+            self._send_transfer_status(chunk.offset, ft.TransferStatus.ABORT)
+            return
+
+        expected = len(transfer.data)
+        problem = None
+        if chunk.offset != expected:
+            problem = ft.TransferStatus.OFFSET_MISMATCH
+        elif compute_crc(chunk.data, transfer.crc) != chunk.crc:
+            problem = ft.TransferStatus.CRC_MISMATCH
+        elif expected + len(chunk.data) > transfer.size:
+            problem = ft.TransferStatus.ABORT
+
+        if problem is not None:
+            transfer.rejections += 1
+            if problem == ft.TransferStatus.ABORT or transfer.rejections > transfer.MAX_REJECTIONS:
+                self._send_transfer_status(expected, ft.TransferStatus.ABORT)
+                transfer.fail(
+                    TransferError(
+                        f"file #{transfer.index}: giving up at byte {expected:,} of "
+                        f"{transfer.size:,} after a bad chunk ({problem.name.lower()})",
+                        file_index=transfer.index,
+                    )
+                )
+            else:
+                # Name the offset we still need, so the watch can send it again.
+                self._send_transfer_status(expected, problem)
+            return
+
+        transfer.rejections = 0
+        transfer.crc = chunk.crc
+        transfer.data.extend(chunk.data)
+        # Acknowledged with the chunk's own offset, as Gadgetbridge does.
+        self._send_transfer_status(chunk.offset, ft.TransferStatus.OK)
+
+        if transfer.progress is not None:
+            try:
+                transfer.progress(len(transfer.data), transfer.size)
+            except Exception:
+                log.exception("Download progress callback raised")
+
+        if len(transfer.data) == transfer.size:
+            transfer.done.set_result(bytes(transfer.data))
+
+    def _send_transfer_status(self, offset: int, status: "ft.TransferStatus") -> None:
+        self._schedule(self._reflex_gfdi(ft.build_file_transfer_status(offset, status)))
+
+    def _fail_download(self, error: Exception) -> None:
+        if self._download is not None:
+            self._download.fail(error)
+
+    async def _wait_until_configured(self) -> None:
+        """Give the watch a moment to finish introducing itself.
+
+        A watch that never sends its capabilities is not treated as an error:
+        the download is attempted anyway and fails on its own terms if the
+        watch really is not ready.
+        """
+        if self._configured.is_set() or self._transport.is_passive:
+            return
+        try:
+            await asyncio.wait_for(self._configured.wait(), self.CONFIGURATION_TIMEOUT)
+        except asyncio.TimeoutError:
+            log.info(
+                "Watch sent no capabilities within %.0fs; trying the transfer anyway",
+                self.CONFIGURATION_TIMEOUT,
+            )
+
+    async def download(
+        self,
+        file: Union["ft.DirectoryEntry", int],
+        progress: Optional[ProgressCallback] = None,
+        timeout: Optional[Duration] = 30.0,
+    ) -> bytes:
+        """Download one file from the watch and return its contents.
+
+        *file* is an entry from :meth:`files`, or a bare file index. *progress*
+        is called with ``(bytes_received, total_bytes)`` after every chunk.
+        *timeout* bounds each step, not the whole download: it is how long the
+        watch may stay silent before the transfer is declared dead.
+
+        Raises :class:`~garmin_ble.errors.TransferError` if the watch refuses or
+        stalls, and :class:`~garmin_ble.errors.ConnectionFailed` if the link
+        drops part-way. Downloads are serialised; the watch serves one at a
+        time.
+        """
+        index = file.index if isinstance(file, ft.DirectoryEntry) else int(file)
+        seconds = _seconds(timeout, 30.0)
+        await self._wait_until_configured()
+
+        async with self._download_lock:
+            transfer = _Download(index, progress)
+            self._download = transfer
+            try:
+                await self._send_gfdi(ft.build_download_request(index))
+                try:
+                    answer = await asyncio.wait_for(asyncio.shield(transfer.accepted), seconds)
+                except asyncio.TimeoutError:
+                    raise TransferError(
+                        f"the watch did not answer the request for file #{index} "
+                        f"within {seconds:.0f}s",
+                        file_index=index,
+                    ) from None
+                if not answer.ok:
+                    raise TransferError(
+                        f"the watch refused to send file #{index}: "
+                        f"{answer.status.name.lower()}",
+                        file_index=index,
+                    )
+
+                while not transfer.done.done():
+                    before = len(transfer.data)
+                    await asyncio.wait({transfer.done}, timeout=seconds)
+                    if not transfer.done.done() and len(transfer.data) == before:
+                        raise TransferError(
+                            f"file #{index} stalled at byte {before:,} of "
+                            f"{transfer.size:,}: nothing received for {seconds:.0f}s",
+                            file_index=index,
+                        )
+                return transfer.done.result()
+            finally:
+                self._download = None
+
+    async def files(self, timeout: Optional[Duration] = 30.0) -> List["ft.DirectoryEntry"]:
+        """List every file stored on the watch.
+
+        Recorded activities, which is what dives are, have
+        ``entry.is_activity`` set. Pass an entry to :meth:`download` to fetch
+        its contents.
+        """
+        listing = await self.download(ft.DIRECTORY_INDEX, timeout=timeout)
+        try:
+            return ft.parse_directory(listing)
+        except ValueError as exc:
+            raise TransferError(str(exc), file_index=ft.DIRECTORY_INDEX) from None
 
     # Dispatch
 

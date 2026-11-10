@@ -8,6 +8,39 @@ versions, and breaking changes are called out explicitly.
 
 ## [Unreleased]
 
+### Added
+
+- **File downloads.** `watch.files()` lists every file on the watch and
+  `watch.download(entry)` returns one file's contents, with a progress
+  callback. A failed download raises the new `TransferError`. Chunks that fail
+  their checksum are requested again. Verified against the simulator, not yet
+  on hardware.
+
+- **`garmin-dive-sync`**, a command that downloads dives from a Garmin Descent
+  into a folder Subsurface can import. It lives in its own package,
+  `garmin_dive_sync`, built on the library. See `docs/dive-sync.md`.
+
+- **The simulator serves files.** `Watch.simulated(files=[SimulatedFile(...)])`,
+  and a `descentmk3` profile.
+
+### Changed
+
+- **The host now introduces itself to the watch.** It answers the watch's
+  device information with its own and exchanges capabilities, as Gadgetbridge
+  does. Watches wait for this before they treat the host as ready to sync.
+  The simulator sends the same opening messages a watch does.
+
+### Fixed
+
+- **Two GFDI frames could interleave on the wire.** A frame spans several BLE
+  writes and acknowledgements are sent from background tasks, so a multi-write
+  frame could be cut in half by an acknowledgement. Sends are now serialised.
+
+- **The COBS decoder dropped frames that shared a notification.** It assumed
+  the buffer held exactly one frame. It now splits on the frame delimiters, so
+  several frames per notification, and frames split across notifications, all
+  decode.
+
 ## [0.3.2] - 2026-08-01
 
 A sweep for the same class of defect as `Watch.capabilities` in 0.3.1:
