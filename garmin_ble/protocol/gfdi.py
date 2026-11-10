@@ -113,6 +113,49 @@ class GfdiMessageBuilder:
         return _build_frame(5000, payload)
 
     @staticmethod
+    def build_device_information_response(
+        watch_protocol_version: int,
+        host_name: str = "garmin-ble",
+        manufacturer: str = "garmin-ble",
+        model: str = "python",
+    ) -> bytes:
+        """Introduce the host in answer to the watch's DEVICE_INFORMATION (5024).
+
+        The watch opens the GFDI channel by describing itself and waits for the
+        host to do the same before it sends its capabilities; without this
+        reply it never reaches the point where a sync is possible. The values
+        are the ones Gadgetbridge sends (``DeviceInformationMessage``).
+        """
+        protocol_flags = 1 if watch_protocol_version // 100 == 1 else 0
+        payload = struct.pack(
+            "<HBHhiHh",
+            5024,       # ref_msg_type = DEVICE_INFORMATION
+            0,          # status = ACK
+            150,        # our protocol version
+            -1,         # our product number
+            -1,         # our unit number
+            7791,       # our software version
+            -1,         # our max packet size
+        )
+        for text in (host_name, manufacturer, model):
+            raw = text.encode("utf-8")[:255]
+            payload += bytes([len(raw)]) + raw
+        payload += bytes([protocol_flags])
+        return _build_frame(5000, payload)
+
+    @staticmethod
+    def build_configuration(capabilities: bytes) -> bytes:
+        """Build a CONFIGURATION (5050) message: a capability bitmask."""
+        capabilities = capabilities[:255]
+        return _build_frame(5050, bytes([len(capabilities)]) + capabilities)
+
+    @staticmethod
+    def build_auth_negotiation_status(unknown: int, flags: int) -> bytes:
+        """Accept the watch's AUTH_NEGOTIATION (5101) by echoing what it asked."""
+        payload = struct.pack("<HBBBI", 5101, 0, 0, unknown & 0xFF, flags & 0xFFFFFFFF)
+        return _build_frame(5000, payload)
+
+    @staticmethod
     def build_system_event(event_type: int, value: int = 0) -> bytes:
         """Build a SYSTEM_EVENT message (type 5030)."""
         payload = struct.pack('<BB', event_type, value)
@@ -180,6 +223,27 @@ def parse_protobuf_frame(message: GfdiMessage) -> Optional[ProtobufFrame]:
         total_length=total_length,
         proto_bytes=message.payload[14 : 14 + proto_len],
     )
+
+
+#: The capability bitmask the host announces in its CONFIGURATION message.
+#: Every bit set, as Gadgetbridge does: the watch decides what to offer.
+HOST_CAPABILITIES = bytes([0xFF] * 13)
+
+
+def parse_configuration(message: GfdiMessage) -> Optional[bytes]:
+    """Pull the capability bitmask out of a CONFIGURATION message."""
+    payload = message.payload
+    if not payload:
+        return None
+    return payload[1 : 1 + payload[0]]
+
+
+def parse_auth_negotiation(message: GfdiMessage) -> Optional["tuple[int, int]"]:
+    """Pull ``(unknown, flags)`` out of an AUTH_NEGOTIATION message."""
+    if len(message.payload) < 5:
+        return None
+    unknown, flags = struct.unpack_from("<BI", message.payload)
+    return unknown, flags
 
 
 def parse_system_event(message: GfdiMessage) -> Optional["tuple[int, int]"]:

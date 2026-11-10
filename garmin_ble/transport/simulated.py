@@ -19,13 +19,16 @@ import asyncio
 import random
 import struct
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Set, Tuple
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from ..constants import GarminMessage, GarminService, RequestType, SystemEventType
 from ..logging import get_logger
 from ..metrics import Metric
 from ..protobuf import gdi_device_status_pb2, gdi_find_my_watch_pb2, gdi_installed_apps_service_pb2
 from ..protocol import cobs as cobs_mod
+from ..protocol import files as ft
+from ..protocol.crc import compute_crc
 from ..protocol import gfdi as gfdi_mod
 from ..protocol import mlr
 from ..protocol.smart import SmartRouter
@@ -54,6 +57,23 @@ class WatchProfile:
     #: to anything not listed.
     intervals: Dict[str, float] = field(default_factory=dict)
     default_interval: float = 1.0
+    #: Largest GFDI message the watch sends, which sets the file chunk size.
+    max_packet_size: int = 375
+
+
+@dataclass(frozen=True)
+class SimulatedFile:
+    """A file for the simulated watch to hold and serve.
+
+    Defaults describe a recorded activity, which is the kind a dive is. File
+    indexes are assigned in order, starting at 1; index 0 is the directory.
+    """
+
+    data: bytes
+    modified: datetime = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    sub_type: int = ft.ACTIVITY_SUB_TYPE
+    data_type: int = ft.FIT_DATA_TYPE
+    flags: int = 0
 
 
 def _profiles() -> Dict[str, WatchProfile]:
@@ -85,6 +105,18 @@ def _profiles() -> Dict[str, WatchProfile]:
                 if metric not in (m.SPO2, m.ACCELEROMETER)
             ),
             apps=("Music", "Body Battery"),
+            intervals=fast,
+            default_interval=0.05,
+        ),
+        # A dive computer, for exercising file transfer the way a dive sync
+        # does. Give it files with ``Watch.simulated(files=...)``.
+        "descentmk3": WatchProfile(
+            name="Descent Mk3i",
+            model="Descent Mk3i - 51mm",
+            firmware="16.21",
+            battery_percent=64,
+            supports=everything,
+            apps=("Dive", "Tides"),
             intervals=fast,
             default_interval=0.05,
         ),
@@ -193,6 +225,7 @@ class SimulatedTransport(Transport):
         address: str = "SI:MU:LA:TE:D0:01",
         time_sync_after: Optional[float] = 0.2,
         system_event_after: Optional[float] = 0.3,
+        files: Sequence[SimulatedFile] = (),
     ):
         super().__init__()
         self.profile = get_profile(profile) if isinstance(profile, str) else profile
@@ -210,6 +243,15 @@ class SimulatedTransport(Transport):
         self._cobs = cobs_mod.CobsCoDec()
         self._outbox: "asyncio.Queue[bytes]" = asyncio.Queue()
         self._tasks: "list[asyncio.Task]" = []
+
+        self._files: List[SimulatedFile] = list(files)
+        self._sending: Optional[bytes] = None   # content of the file in flight
+        self._sent = 0                          # bytes of it acknowledged so far
+        self._sent_crc = 0                      # running CRC of those bytes
+        self._corrupt_chunks = 0
+        self._stalled = False
+        #: File indexes the host has asked for, in order. For tests.
+        self.download_requests: List[int] = []
 
     # Transport contract
 
@@ -235,6 +277,7 @@ class SimulatedTransport(Transport):
                 pass
         self._handles.clear()
         self._streaming.clear()
+        self._sending = None
 
     @property
     def is_open(self) -> bool:
@@ -324,6 +367,7 @@ class SimulatedTransport(Transport):
             return
 
         handle = self._handles.get(service)
+        is_new = handle is None
         if handle is None:
             handle = self._next_handle
             self._next_handle += 1
@@ -333,6 +377,9 @@ class SimulatedTransport(Transport):
                 mlr.CONTROL_HANDLE, mlr.build_register_ml_response(service, handle, status=0)
             )
         )
+        if is_new and service == GarminService.GFDI:
+            # A real watch introduces itself as soon as the channel opens.
+            self._send_gfdi(self._device_information())
 
     def _handle_service_command(self, service: int, command: int) -> None:
         if command == 0x01:
@@ -405,8 +452,128 @@ class SimulatedTransport(Transport):
             self._send_gfdi(gfdi_mod.GfdiMessageBuilder.build_status_ack(message.type))
             return
 
+        if message.type == GarminMessage.DOWNLOAD_REQUEST:
+            self._handle_download_request(message)
+            return
+
+        if message.type == GarminMessage.RESPONSE:
+            self._handle_status(message)
+            return
+
         if message.type != GarminMessage.RESPONSE:
             self._send_gfdi(gfdi_mod.GfdiMessageBuilder.build_status_ack(message.type))
+
+    # Introduction
+
+    def _device_information(self) -> bytes:
+        """The DEVICE_INFORMATION message a watch opens the channel with."""
+        parts = (self.profile.firmware.split(".") + ["0"])[:2]
+        try:
+            software_version = int(parts[0]) * 100 + int(parts[1])
+        except ValueError:
+            software_version = 0
+        payload = struct.pack(
+            "<HHIHH", 150, 4000, 3_400_000_000, software_version,
+            self.profile.max_packet_size,
+        )
+        for text in (self.profile.name, self.profile.name, self.profile.model):
+            raw = text.encode("utf-8")
+            payload += bytes([len(raw)]) + raw
+        return gfdi_mod.GfdiMessageBuilder.build_message(
+            int(GarminMessage.DEVICE_INFORMATION), payload
+        )
+
+    def _handle_status(self, message: gfdi_mod.GfdiMessage) -> None:
+        status = ft.parse_status(message)
+        if status is None:
+            return
+
+        if status.ref_type == GarminMessage.DEVICE_INFORMATION and status.body:
+            # The host introduced itself in return, so send our capabilities.
+            self._send_gfdi(
+                gfdi_mod.GfdiMessageBuilder.build_configuration(bytes([0xFF] * 13))
+            )
+            return
+
+        if status.ref_type == GarminMessage.FILE_TRANSFER_DATA:
+            answer = ft.parse_file_transfer_status(status)
+            if answer is not None:
+                self._handle_transfer_status(answer)
+
+    # File transfer
+
+    def _directory(self) -> List[ft.DirectoryEntry]:
+        return [
+            ft.DirectoryEntry(
+                index=index,
+                data_type=file.data_type,
+                sub_type=file.sub_type,
+                number=index,
+                specific_flags=0,
+                flags=file.flags,
+                size=len(file.data),
+                modified=file.modified,
+            )
+            for index, file in enumerate(self._files, start=1)
+        ]
+
+    def _handle_download_request(self, message: gfdi_mod.GfdiMessage) -> None:
+        request = ft.parse_download_request(message)
+        if request is None:
+            self._send_gfdi(ft.build_download_request_status(ft.DownloadStatus.INVALID))
+            return
+        self.download_requests.append(request.file_index)
+
+        if request.file_index == ft.DIRECTORY_INDEX:
+            content = ft.encode_directory(self._directory())
+        elif 1 <= request.file_index <= len(self._files):
+            content = self._files[request.file_index - 1].data
+        else:
+            self._send_gfdi(
+                ft.build_download_request_status(ft.DownloadStatus.INDEX_UNKNOWN)
+            )
+            return
+
+        self._send_gfdi(ft.build_download_request_status(ft.DownloadStatus.OK, len(content)))
+        self._sending, self._sent, self._sent_crc = content, 0, 0
+        self._send_chunk()
+
+    def _send_chunk(self) -> None:
+        """Send the chunk at the current offset, then wait to be acknowledged."""
+        content = self._sending
+        if content is None or self._sent >= len(content) or self._stalled:
+            return
+        chunk = content[self._sent : self._sent + self._chunk_size]
+        crc = compute_crc(chunk, self._sent_crc)
+        if self._corrupt_chunks:
+            self._corrupt_chunks -= 1
+            crc ^= 0xFFFF
+        self._send_gfdi(ft.build_file_transfer_data(chunk, self._sent, crc))
+
+    def _handle_transfer_status(self, answer: ft.FileTransferStatus) -> None:
+        content = self._sending
+        if content is None:
+            return
+        if answer.status == ft.TransferStatus.ABORT:
+            self._sending = None
+            return
+        if answer.ok:
+            chunk = content[self._sent : self._sent + self._chunk_size]
+            self._sent_crc = compute_crc(chunk, self._sent_crc)
+            self._sent += len(chunk)
+            if self._sent >= len(content):
+                self._sending = None
+                return
+        else:
+            # The host names the offset it still needs.
+            self._sent = min(answer.offset, len(content))
+            self._sent_crc = compute_crc(content[: self._sent])
+        self._send_chunk()
+
+    @property
+    def _chunk_size(self) -> int:
+        """File bytes per FILE_TRANSFER_DATA message, after its 13 of framing."""
+        return max(self.profile.max_packet_size - 13, 1)
 
     def _answer_protobuf(self, frame: gfdi_mod.ProtobufFrame) -> None:
         from ..protobuf import gdi_smart_proto_pb2
@@ -508,6 +675,14 @@ class SimulatedTransport(Transport):
         """
         self._silent = True
 
+    def corrupt_chunks(self, count: int = 1) -> None:
+        """Send the next *count* file chunks with a wrong checksum."""
+        self._corrupt_chunks = count
+
+    def stall_downloads(self) -> None:
+        """Accept download requests but never send any file content."""
+        self._stalled = True
+
     def simulate_drop(self, reason: str = "simulated link loss") -> None:
         """Pull the link out from under the host, as a real watch can."""
         self._open = False
@@ -516,6 +691,7 @@ class SimulatedTransport(Transport):
 
 
 __all__ = [
+    "SimulatedFile",
     "SimulatedTransport",
     "WatchProfile",
     "available_profiles",

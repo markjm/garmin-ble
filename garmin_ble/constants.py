@@ -26,6 +26,7 @@ class SystemEventType(IntEnum):
 
     SYNC_COMPLETE = 0
     SYNC_FAIL = 1
+    SYNC_READY = 8
     TIME_UPDATED = 16
 
 

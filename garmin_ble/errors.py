@@ -120,6 +120,19 @@ class ProtocolError(GarminBleError):
     """A frame from the watch could not be decoded or made sense of."""
 
 
+class TransferError(GarminBleError):
+    """A file could not be downloaded from the watch.
+
+    Raised when the watch refuses the request, stops sending part-way, or keeps
+    sending chunks that fail their checksum. ``file_index`` is the file that
+    was being fetched; index 0 is the directory listing.
+    """
+
+    def __init__(self, message: str, file_index: Optional[int] = None):
+        super().__init__(message)
+        self.file_index = file_index
+
+
 class UnroutableMessage(ProtocolError):
     """A protobuf message has no unambiguous place in the ``Smart`` envelope."""
 
@@ -138,5 +151,6 @@ __all__ = [
     "ServiceUnavailable",
     "RequestTimeout",
     "ProtocolError",
+    "TransferError",
     "UnroutableMessage",
 ]

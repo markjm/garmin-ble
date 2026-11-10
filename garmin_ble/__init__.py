@@ -30,13 +30,15 @@ from .errors import (
     ProtocolError,
     RequestTimeout,
     ServiceUnavailable,
+    TransferError,
     UnroutableMessage,
     WatchNotFound,
 )
 from .frames import Direction, Frame, FrameKind, read_capture
 from .metrics import Metric, Reading
+from .protocol.files import DirectoryEntry
 from .report import Checklist, CollectionResult, Missing
-from .transport import WatchProfile, available_profiles
+from .transport import SimulatedFile, WatchProfile, available_profiles
 from .watch import Battery, DeviceInfo, Diagnostics, InstalledApp, Watch, WatchSession
 
 __version__ = "0.3.2"
@@ -53,6 +55,7 @@ __all__ = [
     "DeviceInfo",
     "Battery",
     "InstalledApp",
+    "DirectoryEntry",
     "Diagnostics",
     "CollectionResult",
     "Missing",
@@ -66,6 +69,7 @@ __all__ = [
     "ServiceUnavailable",
     "RequestTimeout",
     "ProtocolError",
+    "TransferError",
     "UnroutableMessage",
     # tracing
     "Frame",
@@ -74,6 +78,7 @@ __all__ = [
     "read_capture",
     # simulation
     "WatchProfile",
+    "SimulatedFile",
     "available_profiles",
     # protocol constants
     "GarminService",

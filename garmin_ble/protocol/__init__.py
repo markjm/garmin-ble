@@ -10,6 +10,7 @@ from __future__ import annotations
 from .cobs import CobsCoDec
 from .crc import compute_crc
 from .garmin_json import GarminJson, GarminJsonException
+from . import files
 from .gfdi import (
     GfdiMessage,
     GfdiMessageBuilder,
@@ -33,6 +34,7 @@ from .mlr import (
 from .smart import SmartRouter
 
 __all__ = [
+    "files",
     "CobsCoDec",
     "compute_crc",
     "GarminJson",

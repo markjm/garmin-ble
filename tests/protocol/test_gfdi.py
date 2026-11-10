@@ -192,3 +192,48 @@ class TestTimeResponse:
         crc_embedded = struct.unpack('<H', msg[-2:])[0]
         crc_computed = compute_crc(msg[:-2])
         assert crc_embedded == crc_computed
+
+
+class TestIntroduction:
+    """The replies a watch waits for before it will sync."""
+
+    def test_device_information_response_layout(self):
+        import struct
+        from garmin_ble.protocol.gfdi import GfdiMessageBuilder
+
+        frame = GfdiMessageBuilder.build_device_information_response(
+            150, host_name="pc", manufacturer="m", model="x"
+        )
+        assert struct.unpack("<H", frame[2:4])[0] == 5000
+        payload = frame[4:-2]
+        # answered message, ACK, protocol, product, unit, software, max packet
+        assert struct.unpack("<HBHhiHh", payload[:15]) == (5024, 0, 150, -1, -1, 7791, -1)
+        assert payload[15:] == b"\x02pc\x01m\x01x" + b"\x01"
+
+    def test_protocol_flag_follows_the_watch_protocol_version(self):
+        from garmin_ble.protocol.gfdi import GfdiMessageBuilder
+
+        build = GfdiMessageBuilder.build_device_information_response
+        assert build(150)[-3] == 1
+        assert build(214)[-3] == 0
+
+    def test_configuration_round_trip(self):
+        from garmin_ble.protocol.gfdi import (
+            HOST_CAPABILITIES, GfdiMessageBuilder, parse_configuration, parse_message,
+        )
+
+        frame = GfdiMessageBuilder.build_configuration(HOST_CAPABILITIES)
+        message = parse_message(frame)
+        assert message.type == 5050
+        assert parse_configuration(message) == HOST_CAPABILITIES
+
+    def test_auth_negotiation_is_echoed_back(self):
+        import struct
+        from garmin_ble.protocol.gfdi import (
+            GfdiMessageBuilder, parse_auth_negotiation, parse_message,
+        )
+
+        request = parse_message(GfdiMessageBuilder.build_message(5101, struct.pack("<BI", 7, 0x01)))
+        unknown, flags = parse_auth_negotiation(request)
+        reply = GfdiMessageBuilder.build_auth_negotiation_status(unknown, flags)
+        assert reply[4:-2] == struct.pack("<HBBBI", 5101, 0, 0, 7, 0x01)

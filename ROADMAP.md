@@ -18,7 +18,7 @@ _Last updated: 2026-10-23 (v0.3.2)._
 | v0.3.0 | `Watch` API, transports, simulator, and replay | Done |
 | v0.4.0 | Protobuf settings and device state | In progress |
 | v0.5.0 | Notifications and media control | Planned |
-| v0.6.0 | File transfers (FIT and GPX) | Planned |
+| v0.6.0 | File transfers (FIT and GPX) | Downloads done |
 | v1.0.0 | Stable release | Planned |
 
 Working now: connecting and the GFDI V2 handshake, 10 live telemetry streams
@@ -52,8 +52,8 @@ or play sounds.
 This is the largest piece of protocol work left. It is also what gives access
 to stored data such as activities and sleep, in addition to live data.
 
-- [ ] File transfer handshake ([#18](https://github.com/gwerneckp/garmin-ble/issues/18))
-- [ ] Binary chunk reassembly and ACKs ([#19](https://github.com/gwerneckp/garmin-ble/issues/19))
+- [x] File transfer handshake ([#18](https://github.com/gwerneckp/garmin-ble/issues/18)): `watch.files()` lists the directory. Not yet confirmed on hardware.
+- [x] Binary chunk reassembly and ACKs ([#19](https://github.com/gwerneckp/garmin-ble/issues/19)): `watch.download()`. Not yet confirmed on hardware.
 - [ ] Parse FIT files into typed objects ([#20](https://github.com/gwerneckp/garmin-ble/issues/20))
 - [ ] Upload routes and activities ([#21](https://github.com/gwerneckp/garmin-ble/issues/21))
 - [ ] Install apps and watch faces (`.PRG`) ([#22](https://github.com/gwerneckp/garmin-ble/issues/22))
